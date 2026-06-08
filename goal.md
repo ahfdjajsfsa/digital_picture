@@ -1,0 +1,1 @@
+阅读并了解项目结构。完成D:\Github\School\digital_picture\README.md中的第二题。相关图片是D:\Github\School\digital_picture\原图与参考图\blurred wood.bmp。你可以尝试先使用工具对图片进行分析。所有的临时文件都放在D:\Github\School\digital_picture\原图与参考图 中。尝试使用维纳滤波。不断优化参数写入code2.md中。
