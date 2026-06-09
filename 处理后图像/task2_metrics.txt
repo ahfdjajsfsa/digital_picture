@@ -1,0 +1,28 @@
+第二题：降质图像复原指标记录
+
+退化函数估计
+spectrum_line_angle = -17.500 degrees
+top_spectrum_line_angles = [-17.5 -40.5 -39 25 -13.5 33 31 -15] degrees
+motion_theta_initial = 72.500 degrees
+cepstrum_length_candidates = [14 30 36 43] pixels
+motion_psf_length = 16
+motion_psf_theta = 81.0 degrees
+NSR = 0.050000
+pad_size = 96 pixels
+luminance_blend = 0.520
+unsharp_amount = 1.100
+unsharp_radius = 2.000
+sharpen_threshold = 0.018000
+local_contrast = 0.150
+
+Metric                   Input          Wiener         Final         
+Tenengrad                0.071366       0.149998       0.197435      
+Laplacian variance       0.008669       0.009437       0.027441      
+Entropy                  7.054049       7.267876       7.340885      
+High-frequency std       0.037588       0.053390       0.063820      
+Clip ratio               0.000000       0.007047       0.017305      
+
+指标提升
+Tenengrad increase = 176.65%
+Laplacian variance increase = 216.54%
+Entropy increase = 4.07%

@@ -1,1 +1,1 @@
-阅读并了解项目结构。完成D:\Github\School\digital_picture\README.md中的第二题。相关图片是D:\Github\School\digital_picture\原图与参考图\blurred wood.bmp。你可以尝试先使用工具对图片进行分析。所有的临时文件都放在D:\Github\School\digital_picture\原图与参考图 中。尝试使用维纳滤波。不断优化参数写入code2.md中。
+阅读并了解项目结构，理解各文件夹含义。完成D:\Github\School\digital_picture\README.md中的第二题。相关图片是D:\Github\School\digital_picture\原图与参考图\blurred wood.bmp。你可以尝试先使用工具对图片进行分析。所有的临时文件都放在D:\Github\School\digital_picture\原图与参考图 中。尝试使用维纳滤波。不断优化参数写入code2.md中。每次运行matlab得到修复图后，使用你的视觉能力，观察修复图，确保在视觉上变得明显清晰了、不模糊了。如果没有，请继续改进。
