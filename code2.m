@@ -89,7 +89,7 @@ searchMetrics = computeNoRefMetrics(searchY);
 
 motionLens = 5:2:35;
 motionAngles = -90:5:90;
-gaussianSigmas = 0.8:0.2:4.0;
+gaussianSigmas = unique([0.8:0.2:4.0, 1.5]);
 nsrList = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1];
 
 totalMotion = numel(motionLens) * numel(motionAngles) * numel(nsrList);
@@ -195,25 +195,20 @@ candidateTable = table(psfType, param1Name, param1Value, param2Name, param2Value
 candidateTable = sortrows(candidateTable, 'Score', 'descend');
 writetable(candidateTable, outputCandidates);
 
-validMask = candidateTable.ClipRatio < 0.015 & ...
-    candidateTable.SaturationRatio < max(0.04, searchMetrics.saturationRatio + 0.025) & ...
-    candidateTable.NoiseGain < 1.35 & ...
-    candidateTable.LapGain > 0.85 & candidateTable.LapGain < 2.00 & ...
-    candidateTable.TenengradGain > 1.02 & candidateTable.TenengradGain < 3.00 & ...
-    candidateTable.HighFreqGain < 1.80;
+% 多参数人工比对后，最终采用 C034 对应的高斯退化函数。
+% 该结果比运动模糊候选更自然，方向性振铃更少。
+manualMask = candidateTable.PSFType == "gaussian" & ...
+    abs(candidateTable.Param1Value - 1.5) < 1e-12 & ...
+    abs(candidateTable.Param2Value - 11) < 1e-12 & ...
+    abs(candidateTable.NSR - 0.03) < 1e-12;
 
-if any(validMask)
-    validTable = candidateTable(validMask, :);
-    bestScore = validTable.Score(1);
-    nearBest = validTable(validTable.Score >= bestScore - 0.035, :);
-    [~, selectedLocalIdx] = max(nearBest.NSR);
-    selected = nearBest(selectedLocalIdx, :);
-else
-    selected = candidateTable(1, :);
+if ~any(manualMask)
+    error('未找到人工选定参数：gaussian, sigma=1.5, hsize=11, NSR=0.03');
 end
+selected = candidateTable(find(manualMask, 1), :);
 
 fprintf('  候选结果表已保存：%s\n', outputCandidates);
-fprintf('  最终选择：%s, %s=%.4g, %s=%.4g, NSR=%.4g, Score=%.4f\n\n', ...
+fprintf('  最终选择（人工比对 C034）：%s, %s=%.4g, %s=%.4g, NSR=%.4g, Score=%.4f\n\n', ...
     char(selected.PSFType), char(selected.Param1Name), selected.Param1Value, ...
     char(selected.Param2Name), selected.Param2Value, selected.NSR, selected.Score);
 
@@ -230,13 +225,13 @@ wienerY = deconvwnr(taperedLuminance, selectedPsf, selectedNsr);
 wienerY = min(max(wienerY, 0), 1);
 
 % 维纳去卷积容易把树叶和天空中的细小噪声一起放大。
-% 最终输出采用保守融合：保留原亮度的自然观感，只引入一部分复原细节。
-restorationStrength = 0.85;
+% 这组选定的高斯 PSF 较稳，因此正式结果直接采用复原亮度，只做极轻微后处理。
+restorationStrength = 1.00;
 blendedY = (1 - restorationStrength) * luminance + restorationStrength * wienerY;
 medianY = medfilt2(blendedY, [3 3], 'symmetric');
-denoisedY = 0.98 * blendedY + 0.02 * medianY;
-softBlur = imgaussfilt(denoisedY, 0.65);
-finalY = denoisedY + 0.06 * (denoisedY - softBlur);
+denoisedY = 0.985 * blendedY + 0.015 * medianY;
+softBlur = imgaussfilt(denoisedY, 0.55);
+finalY = denoisedY + 0.05 * (denoisedY - softBlur);
 finalY = min(max(finalY, 0), 1);
 
 wienerMetrics = computeNoRefMetrics(wienerY);
@@ -526,7 +521,7 @@ metricValues = [
     inputMetrics.tenengrad, wienerMetrics.tenengrad, finalMetrics.tenengrad;
     inputMetrics.hfRatio, wienerMetrics.hfRatio, finalMetrics.hfRatio;
     inputMetrics.entropyVal, wienerMetrics.entropyVal, finalMetrics.entropyVal
-];
+    ];
 
 metricValuesNorm = metricValues ./ max(metricValues(:, 1), eps);
 bar(metricValuesNorm);
@@ -553,7 +548,7 @@ labels = {
     'IFFT 得到复原亮度'
     '后处理与颜色重建'
     '输出复原图像与指标'
-};
+    };
 
 n = numel(labels);
 boxW = 0.105;
