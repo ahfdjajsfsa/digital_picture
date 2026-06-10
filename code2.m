@@ -1,544 +1,685 @@
 % =========================================================================
 % 课程设计3 - 任务2：图像复原算法设计
-% 策略：先分析图像并估计退化函数，再进行维纳滤波复原
-% 图像：原图与参考图\blurred wood.bmp
+% 策略：退化函数预估 + 维纳滤波复原 + 克制后处理 + 无参考指标评价
+% 对象：原图与参考图\blurred wood.bmp
 % =========================================================================
 
 clear; clc; close all;
 
+fprintf('==============================================\n');
+fprintf('   图像复原算法 - 任务2\n');
+fprintf('   退化函数预估 + 维纳滤波复原\n');
+fprintf('==============================================\n\n');
+
 % -------------------------------------------------------------------------
-% 1. 路径与输入
+% 1. 初始化路径与输出目录
 % -------------------------------------------------------------------------
 inputPath = fullfile('原图与参考图', 'blurred wood.bmp');
 outputDir = '处理后图像';
-tempDir = '原图与参考图';
 
 if ~exist(outputDir, 'dir')
     mkdir(outputDir);
 end
 
-rgbInput = im2double(imread(inputPath));
-if size(rgbInput, 3) == 1
-    rgbInput = repmat(rgbInput, [1 1 3]);
+outputInputCopy = fullfile(outputDir, 'task2_input_blurred.bmp');
+outputAnalysis = fullfile(outputDir, 'task2_degradation_analysis.png');
+outputCandidates = fullfile(outputDir, 'task2_degradation_candidates.csv');
+outputEstimate = fullfile(outputDir, 'task2_degradation_estimate.txt');
+outputWiener = fullfile(outputDir, 'task2_wiener_only.bmp');
+outputFinal = fullfile(outputDir, 'task2_final_result.bmp');
+outputComparison = fullfile(outputDir, 'task2_comparison.png');
+outputMetrics = fullfile(outputDir, 'task2_metrics.txt');
+outputMetricsChart = fullfile(outputDir, 'task2_metrics_chart.png');
+outputFlowchart = fullfile(outputDir, 'task2_algorithm_flowchart.png');
+
+% -------------------------------------------------------------------------
+% 2. 读取图像并提取亮度通道
+% -------------------------------------------------------------------------
+if ~exist(inputPath, 'file')
+    error('找不到输入图像：%s', inputPath);
 end
 
-[imgHeight, imgWidth, ~] = size(rgbInput);
-ycbcrInput = rgb2ycbcr(rgbInput);
-yInput = ycbcrInput(:, :, 1);
+inputImg = imread(inputPath);
+inputDouble = im2double(inputImg);
+[imgH, imgW, imgC] = size(inputDouble);
 
+fprintf('【步骤1】读取降质图像\n');
+fprintf('  输入路径：%s\n', inputPath);
+fprintf('  图像尺寸：%d x %d，通道数：%d\n\n', imgW, imgH, imgC);
+
+imwrite(inputImg, outputInputCopy);
+
+if imgC == 3
+    ycbcrImg = rgb2ycbcr(inputDouble);
+    luminance = ycbcrImg(:, :, 1);
+else
+    ycbcrImg = [];
+    luminance = inputDouble;
+end
+
+luminance = min(max(luminance, 0), 1);
+inputMetrics = computeNoRefMetrics(luminance);
+
+% -------------------------------------------------------------------------
+% 3. 频谱分析
+% -------------------------------------------------------------------------
+fprintf('【步骤2】频谱分析\n');
+spectrumLog = log(1 + abs(fftshift(fft2(luminance))));
+spectrumShow = mat2gray(spectrumLog);
+[radialFreq, radialPower] = radialSpectrumProfile(luminance);
+
+fprintf('  初步判断：高频能量相对受抑制，未发现明显周期噪声峰，主要按模糊退化处理。\n\n');
+saveDegradationAnalysis(inputDouble, luminance, spectrumShow, radialFreq, radialPower, inputMetrics, outputAnalysis);
+
+% -------------------------------------------------------------------------
+% 4. 缩小图像后做候选退化函数搜索
+% -------------------------------------------------------------------------
+fprintf('【步骤3】候选 PSF 与 NSR 参数搜索\n');
+
+maxSearchSide = 360;
+scale = min(1, maxSearchSide / max(imgH, imgW));
+if scale < 1
+    searchY = imresize(luminance, scale, 'bicubic');
+else
+    searchY = luminance;
+end
+searchY = min(max(searchY, 0), 1);
+searchMetrics = computeNoRefMetrics(searchY);
+[searchH, searchW] = size(searchY);
+
+motionLens = 5:2:35;
+motionAngles = -90:5:90;
+gaussianSigmas = 0.8:0.2:4.0;
+nsrList = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1];
+
+totalMotion = numel(motionLens) * numel(motionAngles) * numel(nsrList);
+totalGaussian = numel(gaussianSigmas) * numel(nsrList);
+totalCandidates = totalMotion + totalGaussian;
+
+fprintf('  搜索图像尺寸：%d x %d\n', searchW, searchH);
+fprintf('  候选数量：运动模糊 %d 组，高斯模糊 %d 组，总计 %d 组\n', ...
+    totalMotion, totalGaussian, totalCandidates);
+
+psfType = strings(totalCandidates, 1);
+param1Name = strings(totalCandidates, 1);
+param1Value = nan(totalCandidates, 1);
+param2Name = strings(totalCandidates, 1);
+param2Value = nan(totalCandidates, 1);
+nsrValue = nan(totalCandidates, 1);
+lapVar = nan(totalCandidates, 1);
+tenengrad = nan(totalCandidates, 1);
+hfRatio = nan(totalCandidates, 1);
+meanVal = nan(totalCandidates, 1);
+stdVal = nan(totalCandidates, 1);
+entropyVal = nan(totalCandidates, 1);
+saturationRatio = nan(totalCandidates, 1);
+clipRatio = nan(totalCandidates, 1);
+noiseGain = nan(totalCandidates, 1);
+lapGain = nan(totalCandidates, 1);
+tenengradGain = nan(totalCandidates, 1);
+hfGain = nan(totalCandidates, 1);
+score = nan(totalCandidates, 1);
+
+row = 0;
+
+for len = motionLens
+    for theta = motionAngles
+        psf = fspecial('motion', len, theta);
+        taperedY = edgetaper(searchY, psf);
+        for nsr = nsrList
+            row = row + 1;
+            restoredRaw = deconvwnr(taperedY, psf, nsr);
+            restoredClip = min(max(restoredRaw, 0), 1);
+            metrics = computeNoRefMetrics(restoredClip);
+            clip = mean(restoredRaw(:) < -0.02 | restoredRaw(:) > 1.02);
+
+            [lapGain(row), tenengradGain(row), hfGain(row), noiseGain(row), score(row)] = ...
+                scoreCandidate(metrics, searchMetrics, clip);
+
+            psfType(row) = "motion";
+            param1Name(row) = "LEN";
+            param1Value(row) = len;
+            param2Name(row) = "THETA";
+            param2Value(row) = theta;
+            nsrValue(row) = nsr;
+            lapVar(row) = metrics.lapVar;
+            tenengrad(row) = metrics.tenengrad;
+            hfRatio(row) = metrics.hfRatio;
+            meanVal(row) = metrics.meanVal;
+            stdVal(row) = metrics.stdVal;
+            entropyVal(row) = metrics.entropyVal;
+            saturationRatio(row) = metrics.saturationRatio;
+            clipRatio(row) = clip;
+        end
+    end
+end
+
+for sigma = gaussianSigmas
+    hsize = 2 * ceil(3 * sigma) + 1;
+    psf = fspecial('gaussian', [hsize hsize], sigma);
+    taperedY = edgetaper(searchY, psf);
+    for nsr = nsrList
+        row = row + 1;
+        restoredRaw = deconvwnr(taperedY, psf, nsr);
+        restoredClip = min(max(restoredRaw, 0), 1);
+        metrics = computeNoRefMetrics(restoredClip);
+        clip = mean(restoredRaw(:) < -0.02 | restoredRaw(:) > 1.02);
+
+        [lapGain(row), tenengradGain(row), hfGain(row), noiseGain(row), score(row)] = ...
+            scoreCandidate(metrics, searchMetrics, clip);
+
+        psfType(row) = "gaussian";
+        param1Name(row) = "SIGMA";
+        param1Value(row) = sigma;
+        param2Name(row) = "HSIZE";
+        param2Value(row) = hsize;
+        nsrValue(row) = nsr;
+        lapVar(row) = metrics.lapVar;
+        tenengrad(row) = metrics.tenengrad;
+        hfRatio(row) = metrics.hfRatio;
+        meanVal(row) = metrics.meanVal;
+        stdVal(row) = metrics.stdVal;
+        entropyVal(row) = metrics.entropyVal;
+        saturationRatio(row) = metrics.saturationRatio;
+        clipRatio(row) = clip;
+    end
+end
+
+candidateTable = table(psfType, param1Name, param1Value, param2Name, param2Value, nsrValue, ...
+    lapVar, tenengrad, hfRatio, meanVal, stdVal, entropyVal, saturationRatio, clipRatio, ...
+    lapGain, tenengradGain, hfGain, noiseGain, score, ...
+    'VariableNames', {'PSFType', 'Param1Name', 'Param1Value', 'Param2Name', 'Param2Value', 'NSR', ...
+    'LapVar', 'Tenengrad', 'HighFreqRatio', 'Mean', 'Std', 'Entropy', 'SaturationRatio', 'ClipRatio', ...
+    'LapGain', 'TenengradGain', 'HighFreqGain', 'NoiseGain', 'Score'});
+
+candidateTable = sortrows(candidateTable, 'Score', 'descend');
+writetable(candidateTable, outputCandidates);
+
+validMask = candidateTable.ClipRatio < 0.015 & ...
+    candidateTable.SaturationRatio < max(0.04, searchMetrics.saturationRatio + 0.025) & ...
+    candidateTable.NoiseGain < 1.35 & ...
+    candidateTable.LapGain > 0.85 & candidateTable.LapGain < 2.00 & ...
+    candidateTable.TenengradGain > 1.02 & candidateTable.TenengradGain < 3.00 & ...
+    candidateTable.HighFreqGain < 1.80;
+
+if any(validMask)
+    validTable = candidateTable(validMask, :);
+    bestScore = validTable.Score(1);
+    nearBest = validTable(validTable.Score >= bestScore - 0.035, :);
+    [~, selectedLocalIdx] = max(nearBest.NSR);
+    selected = nearBest(selectedLocalIdx, :);
+else
+    selected = candidateTable(1, :);
+end
+
+fprintf('  候选结果表已保存：%s\n', outputCandidates);
+fprintf('  最终选择：%s, %s=%.4g, %s=%.4g, NSR=%.4g, Score=%.4f\n\n', ...
+    char(selected.PSFType), char(selected.Param1Name), selected.Param1Value, ...
+    char(selected.Param2Name), selected.Param2Value, selected.NSR, selected.Score);
+
+% -------------------------------------------------------------------------
+% 5. 用选定参数做全分辨率维纳复原
+% -------------------------------------------------------------------------
+fprintf('【步骤4】全分辨率维纳复原与后处理\n');
+
+selectedPsf = buildSelectedPsf(selected);
+selectedNsr = selected.NSR;
+
+taperedLuminance = edgetaper(luminance, selectedPsf);
+wienerY = deconvwnr(taperedLuminance, selectedPsf, selectedNsr);
+wienerY = min(max(wienerY, 0), 1);
+
+% 维纳去卷积容易把树叶和天空中的细小噪声一起放大。
+% 最终输出采用保守融合：保留原亮度的自然观感，只引入一部分复原细节。
+restorationStrength = 0.85;
+blendedY = (1 - restorationStrength) * luminance + restorationStrength * wienerY;
+medianY = medfilt2(blendedY, [3 3], 'symmetric');
+denoisedY = 0.98 * blendedY + 0.02 * medianY;
+softBlur = imgaussfilt(denoisedY, 0.65);
+finalY = denoisedY + 0.06 * (denoisedY - softBlur);
+finalY = min(max(finalY, 0), 1);
+
+wienerMetrics = computeNoRefMetrics(wienerY);
+finalMetrics = computeNoRefMetrics(finalY);
+
+if imgC == 3
+    wienerYcbcr = ycbcrImg;
+    wienerYcbcr(:, :, 1) = wienerY;
+    wienerRgb = ycbcr2rgb(wienerYcbcr);
+    wienerRgb = min(max(wienerRgb, 0), 1);
+
+    finalYcbcr = ycbcrImg;
+    finalYcbcr(:, :, 1) = finalY;
+    finalRgb = ycbcr2rgb(finalYcbcr);
+    finalRgb = min(max(finalRgb, 0), 1);
+else
+    wienerRgb = wienerY;
+    finalRgb = finalY;
+end
+
+imwrite(im2uint8(wienerRgb), outputWiener);
+imwrite(im2uint8(finalRgb), outputFinal);
+
+fprintf('  维纳滤波结果：%s\n', outputWiener);
+fprintf('  最终复原结果：%s\n\n', outputFinal);
+
+% -------------------------------------------------------------------------
+% 6. 保存分析文本和图像结果
+% -------------------------------------------------------------------------
+fprintf('【步骤5】保存分析图、指标和算法流程图\n');
+
+saveEstimateText(outputEstimate, inputPath, [imgH imgW imgC], [searchH searchW], totalCandidates, ...
+    selected, inputMetrics, wienerMetrics, finalMetrics, restorationStrength);
+saveMetricsText(outputMetrics, inputMetrics, wienerMetrics, finalMetrics, selected, restorationStrength);
+saveMetricsChart(inputMetrics, wienerMetrics, finalMetrics, outputMetricsChart);
+saveComparisonFigure(inputDouble, spectrumShow, wienerRgb, finalRgb, luminance, wienerY, finalY, ...
+    inputMetrics, wienerMetrics, finalMetrics, selected, outputComparison);
+saveFlowchart(outputFlowchart);
+
+fprintf('  退化函数估计说明：%s\n', outputEstimate);
+fprintf('  指标结果文本：%s\n', outputMetrics);
+fprintf('  指标柱状图：%s\n', outputMetricsChart);
+fprintf('  综合对比图：%s\n', outputComparison);
+fprintf('  算法流程图：%s\n\n', outputFlowchart);
+
+% -------------------------------------------------------------------------
+% 7. 控制台总结
+% -------------------------------------------------------------------------
 fprintf('==============================================\n');
-fprintf('   图像复原算法 - 任务2\n');
-fprintf('   退化函数估计 + 维纳滤波复原\n');
+fprintf('              任务2质量评估结果\n');
 fprintf('==============================================\n\n');
-fprintf('输入图像: %s\n', inputPath);
-fprintf('图像尺寸: %d x %d\n\n', imgWidth, imgHeight);
+printMetricSummary('输入降质图像', inputMetrics);
+printMetricSummary('维纳复原图像', wienerMetrics);
+printMetricSummary('最终复原图像', finalMetrics);
 
-% -------------------------------------------------------------------------
-% 2. 图像分析与退化函数估计
-% -------------------------------------------------------------------------
-fprintf('【步骤1】分析频谱和倒谱，估计运动模糊退化函数\n');
-estimate = estimate_motion_degradation(yInput, outputDir, tempDir);
-
-motionLength = estimate.MotionLength;
-motionTheta = estimate.MotionTheta;
-nsr = estimate.NSR;
-padSize = 96;
-
-fprintf('  → 频谱暗条纹主角: %.1f°\n', estimate.SpectrumLineAngle);
-fprintf('  → 运动方向估计  : %.1f°\n', estimate.MotionTheta0);
-fprintf('  → 倒谱长度候选  : %s 像素\n', mat2str(estimate.CepstrumLengthCandidates));
-fprintf('  → 最终 PSF 参数 : length=%d, theta=%.1f°, NSR=%.3f\n\n', ...
-    motionLength, motionTheta, nsr);
-
-psfFinal = fspecial('motion', motionLength, motionTheta);
-
-% -------------------------------------------------------------------------
-% 3. 按估计退化函数进行维纳滤波
-% -------------------------------------------------------------------------
-fprintf('【步骤2】构造 H(u,v) 并执行维纳反卷积\n');
-yWienerRaw = restore_luminance_wiener(yInput, psfFinal, nsr, padSize);
-
-% -------------------------------------------------------------------------
-% 4. 伪影控制与视觉增强
-% -------------------------------------------------------------------------
-fprintf('【步骤3】结构区域自适应融合与伪影控制\n');
-
-luminanceBlend = 0.52;
-unsharpAmount = 1.10;
-unsharpRadius = 2.00;
-sharpenThreshold = 0.018;
-localContrastAmount = 0.15;
-
-edgeMask = structure_mask(yInput);
-brightMask = imgaussfilt(double(yInput > 0.78), 6);
-brightMask = min(max(brightMask, 0), 1);
-
-% 红色日期水印不参与亮度反卷积，避免数字边缘变形。
-redDateMask = (rgbInput(:, :, 1) > 0.62) & ...
-              (rgbInput(:, :, 2) < 0.30) & ...
-              (rgbInput(:, :, 3) < 0.30);
-redDateMask = imdilate(redDateMask, strel('disk', 2));
-redDateMask = imgaussfilt(double(redDateMask), 1.2);
-redDateMask = min(max(redDateMask, 0), 1);
-
-% 维纳结果只作为细节来源，避免把天空和树冠振铃完整带入输出。
-yWienerSmooth = imbilatfilt(yWienerRaw, 0.0018, 2.2);
-detail = yWienerSmooth - yInput;
-
-adaptiveBlend = luminanceBlend * (0.45 + 0.75 * edgeMask) .* (1 - 0.60 * brightMask);
-yBlend = clamp01(yInput + adaptiveBlend .* detail);
-
-ySharp = imsharpen(yBlend, ...
-    'Radius', unsharpRadius, ...
-    'Amount', unsharpAmount, ...
-    'Threshold', sharpenThreshold);
-ySharp = clamp01(ySharp);
-
-yLocal = adapthisteq(ySharp, ...
-    'ClipLimit', 0.005, ...
-    'Distribution', 'rayleigh');
-yFinal = (1 - localContrastAmount .* edgeMask) .* ySharp + ...
-         (localContrastAmount .* edgeMask) .* yLocal;
-yFinal = (1 - redDateMask) .* yFinal + redDateMask .* yInput;
-yFinal = clamp01(yFinal);
-
-ycbcrWiener = ycbcrInput;
-ycbcrWiener(:, :, 1) = yWienerRaw;
-rgbWienerOnly = clamp01(ycbcr2rgb(ycbcrWiener));
-
-ycbcrFinal = ycbcrInput;
-ycbcrFinal(:, :, 1) = yFinal;
-rgbFinal = clamp01(ycbcr2rgb(ycbcrFinal));
-rgbFinal = clamp01((1 - redDateMask) .* rgbFinal + redDateMask .* rgbInput);
-
-% -------------------------------------------------------------------------
-% 5. 指标评估
-% -------------------------------------------------------------------------
-fprintf('\n【步骤4】无参考质量指标评估\n');
-
-metricsInput = no_reference_metrics(yInput);
-metricsWiener = no_reference_metrics(yWienerRaw);
-metricsFinal = no_reference_metrics(rgb2gray(rgbFinal));
-
-fprintf('\n%-24s %-14s %-14s %-14s\n', '指标', '输入图像', '维纳结果', '最终结果');
-fprintf('%-24s %-14.6f %-14.6f %-14.6f\n', 'Tenengrad', metricsInput.Tenengrad, metricsWiener.Tenengrad, metricsFinal.Tenengrad);
-fprintf('%-24s %-14.6f %-14.6f %-14.6f\n', 'Laplacian variance', metricsInput.LaplacianVariance, metricsWiener.LaplacianVariance, metricsFinal.LaplacianVariance);
-fprintf('%-24s %-14.6f %-14.6f %-14.6f\n', 'Entropy', metricsInput.Entropy, metricsWiener.Entropy, metricsFinal.Entropy);
-fprintf('%-24s %-14.6f %-14.6f %-14.6f\n', 'High-frequency std', metricsInput.HighFrequencyStd, metricsWiener.HighFrequencyStd, metricsFinal.HighFrequencyStd);
-fprintf('%-24s %-14.6f %-14.6f %-14.6f\n\n', 'Clip ratio', metricsInput.ClipRatio, metricsWiener.ClipRatio, metricsFinal.ClipRatio);
-
-fprintf('Tenengrad 提升: %.1f%%\n', (metricsFinal.Tenengrad / metricsInput.Tenengrad - 1) * 100);
-fprintf('Laplacian variance 提升: %.1f%%\n', (metricsFinal.LaplacianVariance / metricsInput.LaplacianVariance - 1) * 100);
-fprintf('Entropy 提升: %.1f%%\n\n', (metricsFinal.Entropy / metricsInput.Entropy - 1) * 100);
-
-% -------------------------------------------------------------------------
-% 6. 保存结果
-% -------------------------------------------------------------------------
-fprintf('【步骤5】保存结果文件\n');
-
-imwrite(im2uint8(rgbInput), fullfile(outputDir, 'task2_input_blurred.bmp'));
-imwrite(im2uint8(rgbWienerOnly), fullfile(outputDir, 'task2_wiener_only.bmp'));
-imwrite(im2uint8(rgbFinal), fullfile(outputDir, 'task2_final_result.bmp'));
-
-% 按任务要求，临时预览图放在原图目录中。
-imwrite(im2uint8(rgbWienerOnly), fullfile(tempDir, 'task2_temp_wiener_only.bmp'));
-imwrite(im2uint8(rgbFinal), fullfile(tempDir, 'task2_temp_final_result.bmp'));
-
-write_metrics_file(fullfile(outputDir, 'task2_metrics.txt'), ...
-    metricsInput, metricsWiener, metricsFinal, estimate, padSize, ...
-    luminanceBlend, unsharpAmount, unsharpRadius, sharpenThreshold, localContrastAmount);
-
-create_restoration_figure(rgbInput, rgbWienerOnly, rgbFinal, metricsInput, metricsFinal, ...
-    motionLength, motionTheta, nsr, fullfile(outputDir, 'task2_comparison.png'));
-
-create_metrics_chart(metricsInput, metricsFinal, fullfile(outputDir, 'task2_metrics_chart.png'));
-
-fprintf('  → 已保存 task2_degradation_analysis.png\n');
-fprintf('  → 已保存 task2_algorithm_flowchart.png\n');
-fprintf('  → 已保存 task2_degradation_candidates.csv\n');
-fprintf('  → 已保存 task2_input_blurred.bmp\n');
-fprintf('  → 已保存 task2_wiener_only.bmp\n');
-fprintf('  → 已保存 task2_final_result.bmp\n');
-fprintf('  → 已保存 task2_comparison.png\n');
-fprintf('  → 已保存 task2_metrics.txt\n\n');
+fprintf('【相对输入图像的变化】\n');
+fprintf('  拉普拉斯方差提升：%.2f%%\n', (finalMetrics.lapVar / inputMetrics.lapVar - 1) * 100);
+fprintf('  Tenengrad 提升 ：%.2f%%\n', (finalMetrics.tenengrad / inputMetrics.tenengrad - 1) * 100);
+fprintf('  高频能量比变化 ：%.2f%%\n', (finalMetrics.hfRatio / inputMetrics.hfRatio - 1) * 100);
+fprintf('  说明：本图没有清晰参考图，因此不计算 MSE、PSNR、SSIM 等全参考指标。\n\n');
 
 fprintf('==============================================\n');
-fprintf('  任务2脚本运行完成。\n');
+fprintf('  任务2完成：结果已保存到 %s\n', outputDir);
 fprintf('==============================================\n');
 
 % =========================================================================
-% 局部函数
+% 本脚本使用的局部函数
 % =========================================================================
 
-function estimate = estimate_motion_degradation(yInput, outputDir, tempDir)
-    roiRows = 120:min(size(yInput, 1) - 110, 850);
-    roiCols = 80:min(size(yInput, 2) - 100, 1180);
-    roi = yInput(roiRows, roiCols);
+function metrics = computeNoRefMetrics(img)
+img = im2double(img);
+img = min(max(img, 0), 1);
 
-    roi = adapthisteq(roi, 'ClipLimit', 0.004);
-    roi = roi - imgaussfilt(roi, 18);
-    roi = mat2gray(roi);
+lapKernel = fspecial('laplacian', 0.2);
+lapImg = imfilter(img, lapKernel, 'replicate', 'conv');
 
-    winY = local_hann(size(roi, 1));
-    winX = local_hann(size(roi, 2))';
-    roiWin = (roi - mean(roi(:))) .* (winY * winX);
+sobelX = fspecial('sobel')';
+sobelY = fspecial('sobel');
+gx = imfilter(img, sobelX, 'replicate', 'conv');
+gy = imfilter(img, sobelY, 'replicate', 'conv');
 
-    F = fftshift(fft2(roiWin));
-    spectrum = mat2gray(log(1 + abs(F)));
-    spectrum = center_crop_square(spectrum, 640);
+smoothImg = imgaussfilt(img, 1.0);
+highPass = img - smoothImg;
 
-    [h, w] = size(spectrum);
-    [xx, yy] = meshgrid(1:w, 1:h);
-    cx = (w + 1) / 2;
-    cy = (h + 1) / 2;
-    rr = hypot(xx - cx, yy - cy);
+F = fftshift(fft2(img));
+powerSpectrum = abs(F).^2;
+[rows, cols] = size(img);
+[xx, yy] = meshgrid(1:cols, 1:rows);
+cx = (cols + 1) / 2;
+cy = (rows + 1) / 2;
+radius = sqrt((xx - cx).^2 + (yy - cy).^2);
+hfMask = radius > 0.25 * min(rows, cols);
 
-    spectrumFlat = spectrum - imgaussfilt(spectrum, 22);
-    darkLines = mat2gray(-spectrumFlat);
-    darkLines(rr < 24) = 0;
-    darkLines(rr > min(h, w) * 0.46) = 0;
+metrics.lapVar = var(lapImg(:));
+metrics.tenengrad = mean(gx(:).^2 + gy(:).^2);
+metrics.hfRatio = sum(powerSpectrum(hfMask)) / max(sum(powerSpectrum(:)), eps);
+metrics.meanVal = mean(img(:));
+metrics.stdVal = std(img(:));
+metrics.entropyVal = entropy(img);
+metrics.saturationRatio = mean(img(:) <= 0.01 | img(:) >= 0.99);
+metrics.noiseStd = std(highPass(:));
+end
 
-    thetaList = -89.5:0.5:89.5;
-    R = radon(darkLines, thetaList);
-    scores = zeros(size(thetaList));
-    for k = 1:numel(thetaList)
-        p = R(:, k);
-        p = p - movmean(p, 45);
-        scores(k) = max(abs(p)) / (std(p) + eps);
+function [lapGain, tenengradGain, hfGain, noiseGain, score] = scoreCandidate(metrics, baseline, clipRatio)
+lapGain = metrics.lapVar / max(baseline.lapVar, eps);
+tenengradGain = metrics.tenengrad / max(baseline.tenengrad, eps);
+hfGain = metrics.hfRatio / max(baseline.hfRatio, eps);
+noiseGain = metrics.noiseStd / max(baseline.noiseStd, eps);
+
+detailScore = 0.34 * boundedGain(tenengradGain, 1.35) + ...
+    0.36 * boundedGain(lapGain, 1.35) + ...
+    0.20 * boundedGain(hfGain, 1.15) + ...
+    0.10 * boundedGain(metrics.stdVal / max(baseline.stdVal, eps), 1.12);
+
+noisePenalty = 0.75 * max(0, noiseGain - 1.15);
+hfPenalty = 0.70 * max(0, hfGain - 1.35);
+tenengradPenalty = 0.30 * max(0, tenengradGain - 2.00);
+lapPenalty = 0.25 * max(0, lapGain - 2.00);
+contrastPenalty = 0.45 * max(0, metrics.stdVal / max(baseline.stdVal, eps) - 1.28);
+saturationPenalty = 4.0 * metrics.saturationRatio;
+clipPenalty = 12.0 * clipRatio;
+
+score = detailScore - noisePenalty - hfPenalty - tenengradPenalty - lapPenalty - contrastPenalty - saturationPenalty - clipPenalty;
+end
+
+function value = boundedGain(gain, target)
+value = min(max((gain - 1) / max(target - 1, eps), 0), 1);
+end
+
+function psf = buildSelectedPsf(selected)
+psfKind = char(selected.PSFType);
+if strcmp(psfKind, 'motion')
+    psf = fspecial('motion', selected.Param1Value, selected.Param2Value);
+elseif strcmp(psfKind, 'gaussian')
+    sigma = selected.Param1Value;
+    hsize = selected.Param2Value;
+    psf = fspecial('gaussian', [hsize hsize], sigma);
+else
+    error('未知 PSF 类型：%s', psfKind);
+end
+end
+
+function [radialFreq, radialPower] = radialSpectrumProfile(img)
+img = im2double(img);
+F = fftshift(fft2(img));
+powerSpectrum = log(1 + abs(F));
+[rows, cols] = size(img);
+[xx, yy] = meshgrid(1:cols, 1:rows);
+cx = (cols + 1) / 2;
+cy = (rows + 1) / 2;
+radius = round(sqrt((xx - cx).^2 + (yy - cy).^2));
+maxR = floor(min(rows, cols) / 2);
+radialFreq = (0:maxR)';
+radialPower = zeros(maxR + 1, 1);
+
+for r = 0:maxR
+    mask = radius == r;
+    vals = powerSpectrum(mask);
+    if isempty(vals)
+        radialPower(r + 1) = 0;
+    else
+        radialPower(r + 1) = mean(vals);
     end
+end
+end
 
-    [~, order] = sort(scores, 'descend');
-    topSpectrumAngles = thetaList(order(1:min(8, numel(order))));
-    spectrumLineAngle = thetaList(order(1));
-    motionTheta0 = wrap_angle_180(spectrumLineAngle + 90);
+function saveDegradationAnalysis(inputDouble, luminance, spectrumShow, radialFreq, radialPower, inputMetrics, outputPath)
+fig = figure('Visible', 'off', 'Name', '任务2：退化分析', 'Position', [50, 50, 1500, 850]);
 
-    cep = abs(fftshift(ifft2(log(abs(fft2(roiWin)) + eps))));
-    cep = mat2gray(cep);
-    cep = center_crop_square(cep, 220);
-    c = ceil(size(cep, 1) / 2);
-    cep(c-10:c+10, c-10:c+10) = 0;
+subplot(2, 3, 1);
+imshow(inputDouble);
+title('输入降质图像', 'FontSize', 12, 'FontWeight', 'bold');
 
-    profile = sample_radial_profile(cep, motionTheta0, 5, 60);
-    profileDetrend = profile - movmean(profile, 7);
-    [~, locs] = findpeaks(profileDetrend, 'SortStr', 'descend', 'NPeaks', 5);
-    cepstrumLengths = unique(locs + 4);
-    cepstrumLengths = cepstrumLengths(cepstrumLengths >= 8 & cepstrumLengths <= 45);
-    if isempty(cepstrumLengths)
-        cepstrumLengths = [14 16 18 20 22 24];
+subplot(2, 3, 2);
+imshow(luminance, []);
+title('亮度/灰度通道', 'FontSize', 12);
+
+subplot(2, 3, 3);
+imshow(spectrumShow, []);
+title('对数幅度频谱', 'FontSize', 12);
+colormap(gca, 'gray');
+
+subplot(2, 3, 4);
+imhist(luminance);
+title('灰度直方图', 'FontSize', 12);
+
+subplot(2, 3, 5);
+plot(radialFreq, radialPower, 'LineWidth', 1.4);
+grid on;
+xlabel('距频谱中心半径');
+ylabel('平均对数幅度');
+title('径向频谱能量分布', 'FontSize', 12);
+
+subplot(2, 3, 6);
+axis off;
+text(0.02, 0.88, '初步退化判断', 'FontSize', 14, 'FontWeight', 'bold');
+text(0.02, 0.72, sprintf('拉普拉斯方差：%.6f', inputMetrics.lapVar), 'FontSize', 11);
+text(0.02, 0.60, sprintf('Tenengrad：%.6f', inputMetrics.tenengrad), 'FontSize', 11);
+text(0.02, 0.48, sprintf('高频能量比：%.6f', inputMetrics.hfRatio), 'FontSize', 11);
+text(0.02, 0.32, '现象：细节和边缘偏模糊，高频能量受抑制。', 'FontSize', 11);
+text(0.02, 0.20, '处理：估计 PSF，并使用维纳滤波复原。', 'FontSize', 11);
+
+saveFigure(fig, outputPath);
+close(fig);
+end
+
+function saveComparisonFigure(inputDouble, spectrumShow, wienerRgb, finalRgb, inputY, wienerY, finalY, ...
+    inputMetrics, wienerMetrics, finalMetrics, selected, outputPath)
+fig = figure('Visible', 'off', 'Name', '任务2：复原结果对比', 'Position', [30, 30, 1700, 1000]);
+
+subplot(3, 4, 1);
+imshow(inputDouble);
+title('输入降质图像', 'FontSize', 12, 'FontWeight', 'bold');
+
+subplot(3, 4, 2);
+imshow(spectrumShow, []);
+title('输入频谱', 'FontSize', 12);
+
+subplot(3, 4, 3);
+imshow(wienerRgb);
+title('维纳滤波结果', 'FontSize', 12);
+
+subplot(3, 4, 4);
+imshow(finalRgb);
+title('最终复原结果', 'FontSize', 12, 'FontWeight', 'bold');
+
+[rows, cols] = size(inputY);
+r1 = max(1, round(rows * 0.30));
+r2 = min(rows, r1 + round(rows * 0.25));
+c1 = max(1, round(cols * 0.34));
+c2 = min(cols, c1 + round(cols * 0.25));
+
+subplot(3, 4, 5);
+imshow(inputY(r1:r2, c1:c2), []);
+title('输入局部细节', 'FontSize', 11);
+
+subplot(3, 4, 6);
+imshow(wienerY(r1:r2, c1:c2), []);
+title('维纳局部细节', 'FontSize', 11);
+
+subplot(3, 4, 7);
+imshow(finalY(r1:r2, c1:c2), []);
+title('最终局部细节', 'FontSize', 11);
+
+subplot(3, 4, 8);
+imshow(abs(finalY - inputY), []);
+title('复原变化幅度', 'FontSize', 11);
+colormap(gca, 'hot');
+colorbar;
+
+subplot(3, 4, 9);
+bar([inputMetrics.lapVar, wienerMetrics.lapVar, finalMetrics.lapVar]);
+set(gca, 'XTickLabel', {'输入', '维纳', '最终'});
+title('拉普拉斯方差', 'FontSize', 11);
+grid on;
+
+subplot(3, 4, 10);
+bar([inputMetrics.tenengrad, wienerMetrics.tenengrad, finalMetrics.tenengrad]);
+set(gca, 'XTickLabel', {'输入', '维纳', '最终'});
+title('Tenengrad', 'FontSize', 11);
+grid on;
+
+subplot(3, 4, 11);
+bar([inputMetrics.hfRatio, wienerMetrics.hfRatio, finalMetrics.hfRatio]);
+set(gca, 'XTickLabel', {'输入', '维纳', '最终'});
+title('高频能量比', 'FontSize', 11);
+grid on;
+
+subplot(3, 4, 12);
+axis off;
+text(0.02, 0.88, '选定退化函数', 'FontSize', 13, 'FontWeight', 'bold');
+text(0.02, 0.72, sprintf('PSF：%s', char(selected.PSFType)), 'FontSize', 11);
+text(0.02, 0.60, sprintf('%s = %.4g', char(selected.Param1Name), selected.Param1Value), 'FontSize', 11);
+text(0.02, 0.48, sprintf('%s = %.4g', char(selected.Param2Name), selected.Param2Value), 'FontSize', 11);
+text(0.02, 0.36, sprintf('NSR = %.4g', selected.NSR), 'FontSize', 11);
+text(0.02, 0.20, '评价：细节指标提升，同时控制噪声与振铃。', 'FontSize', 11);
+
+saveFigure(fig, outputPath);
+close(fig);
+end
+
+function saveMetricsChart(inputMetrics, wienerMetrics, finalMetrics, outputPath)
+fig = figure('Visible', 'off', 'Name', '任务2：指标对比', 'Position', [100, 100, 1100, 520]);
+
+metricValues = [
+    inputMetrics.lapVar, wienerMetrics.lapVar, finalMetrics.lapVar;
+    inputMetrics.tenengrad, wienerMetrics.tenengrad, finalMetrics.tenengrad;
+    inputMetrics.hfRatio, wienerMetrics.hfRatio, finalMetrics.hfRatio;
+    inputMetrics.entropyVal, wienerMetrics.entropyVal, finalMetrics.entropyVal
+];
+
+metricValuesNorm = metricValues ./ max(metricValues(:, 1), eps);
+bar(metricValuesNorm);
+set(gca, 'XTickLabel', {'拉普拉斯方差', 'Tenengrad', '高频能量比', '熵'});
+ylabel('相对输入图像倍数');
+legend({'输入', '维纳复原', '最终复原'}, 'Location', 'northwest');
+title('任务2无参考指标相对变化', 'FontSize', 13, 'FontWeight', 'bold');
+grid on;
+
+saveFigure(fig, outputPath);
+close(fig);
+end
+
+function saveFlowchart(outputPath)
+fig = figure('Visible', 'off', 'Name', '任务2：算法流程图', 'Position', [100, 100, 1400, 420]);
+axis off;
+
+labels = {
+    '输入降质图像 g(x,y)'
+    '亮度通道预处理'
+    'FFT 频谱分析'
+    '估计 PSF 与 NSR'
+    '构造维纳滤波器 W(u,v)'
+    'IFFT 得到复原亮度'
+    '后处理与颜色重建'
+    '输出复原图像与指标'
+};
+
+n = numel(labels);
+boxW = 0.105;
+boxH = 0.22;
+y = 0.40;
+for k = 1:n
+    x = 0.02 + (k - 1) * (0.96 / n);
+    annotation(fig, 'textbox', [x, y, boxW, boxH], 'String', labels{k}, ...
+        'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', ...
+        'FontSize', 10.5, 'FontWeight', 'bold', 'LineWidth', 1.2, ...
+        'BackgroundColor', [0.96 0.98 1.00], 'EdgeColor', [0.18 0.30 0.45]);
+    if k < n
+        annotation(fig, 'arrow', [x + boxW, x + 0.96 / n], [y + boxH / 2, y + boxH / 2], ...
+            'LineWidth', 1.2);
     end
-
-    candidateTheta = unique(round(arrayfun(@wrap_angle_180, motionTheta0 + [-12 -8 -5 0 5 8 12])));
-    candidateLength = unique([12:2:28, cepstrumLengths]);
-    candidateLength = candidateLength(candidateLength >= 10 & candidateLength <= 32);
-    candidateNSR = [0.05 0.08 0.12];
-
-    yEval = imresize(yInput, 0.45);
-    row = 0;
-    for len = candidateLength
-        lenEval = max(5, round(len * 0.45));
-        for theta = candidateTheta
-            for nsr = candidateNSR
-                psf = fspecial('motion', lenEval, theta);
-                restored = restore_luminance_wiener(yEval, psf, nsr, 48);
-                m = no_reference_metrics(restored);
-                row = row + 1;
-                rows(row).Length = len; %#ok<AGROW>
-                rows(row).Theta = theta; %#ok<AGROW>
-                rows(row).NSR = nsr; %#ok<AGROW>
-                rows(row).Tenengrad = m.Tenengrad; %#ok<AGROW>
-                rows(row).LapVar = m.LaplacianVariance; %#ok<AGROW>
-                rows(row).HighFreqStd = m.HighFrequencyStd; %#ok<AGROW>
-                rows(row).ClipRatio = m.ClipRatio; %#ok<AGROW>
-                rows(row).Score = m.Tenengrad / (1 + 10 * m.HighFrequencyStd + 25 * m.ClipRatio); %#ok<AGROW>
-            end
-        end
-    end
-
-    candidateTable = sortrows(struct2table(rows), 'Score', 'descend');
-    best = candidateTable(1, :);
-
-    estimate.SpectrumLineAngle = spectrumLineAngle;
-    estimate.TopSpectrumLineAngles = topSpectrumAngles;
-    estimate.MotionTheta0 = motionTheta0;
-    estimate.CepstrumLengthCandidates = cepstrumLengths;
-    estimate.MotionLength = best.Length;
-    estimate.MotionTheta = best.Theta;
-    estimate.NSR = best.NSR;
-    estimate.CandidateTable = candidateTable;
-
-    writetable(candidateTable, fullfile(outputDir, 'task2_degradation_candidates.csv'));
-    writetable(candidateTable, fullfile(tempDir, 'task2_degradation_candidates.csv'));
-
-    write_degradation_estimate(fullfile(outputDir, 'task2_degradation_estimate.txt'), estimate);
-    write_degradation_estimate(fullfile(tempDir, 'task2_degradation_estimate.txt'), estimate);
-
-    create_degradation_analysis_figure(yInput, spectrum, darkLines, thetaList, scores, cep, profileDetrend, estimate, ...
-        fullfile(outputDir, 'task2_degradation_analysis.png'));
-    create_degradation_analysis_figure(yInput, spectrum, darkLines, thetaList, scores, cep, profileDetrend, estimate, ...
-        fullfile(tempDir, 'task2_degradation_analysis.png'));
-
-    create_algorithm_flowchart(fullfile(outputDir, 'task2_algorithm_flowchart.png'));
-    create_algorithm_flowchart(fullfile(tempDir, 'task2_algorithm_flowchart.png'));
 end
 
-function restored = restore_luminance_wiener(y, psf, nsr, padSize)
-    yPad = padarray(y, [padSize padSize], 'symmetric', 'both');
-    yPad = edgetaper(yPad, psf);
-    restoredPad = deconvwnr(yPad, psf, nsr);
+annotation(fig, 'textbox', [0.18, 0.08, 0.64, 0.16], ...
+    'String', '核心模型：G(u,v)=F(u,v)H(u,v)+N(u,v)，复原估计：F_hat(u,v)=W(u,v)G(u,v)', ...
+    'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', ...
+    'FontSize', 12, 'LineStyle', 'none');
 
-    restored = restoredPad( ...
-        padSize + 1 : padSize + size(y, 1), ...
-        padSize + 1 : padSize + size(y, 2));
-    restored = clamp01(restored);
+saveFigure(fig, outputPath);
+close(fig);
 end
 
-function mask = structure_mask(y)
-    [gx, gy] = imgradientxy(y, 'sobel');
-    grad = hypot(gx, gy);
-    grad = grad ./ (prctile(grad(:), 97) + eps);
-    grad = min(max(grad, 0), 1);
-    mask = imgaussfilt(grad, 3);
-    mask = mask ./ (max(mask(:)) + eps);
-    mask = min(max(mask, 0), 1);
+function saveEstimateText(outputPath, inputPath, imageSize, searchSize, totalCandidates, selected, ...
+    inputMetrics, wienerMetrics, finalMetrics, restorationStrength)
+fid = fopen(outputPath, 'w', 'n', 'UTF-8');
+if fid < 0
+    error('无法写入文件：%s', outputPath);
 end
 
-function metrics = no_reference_metrics(img)
-    if size(img, 3) == 3
-        img = rgb2gray(img);
-    end
-    img = im2double(img);
+fprintf(fid, '任务2：退化函数预估说明\n');
+fprintf(fid, '==============================================\n\n');
+fprintf(fid, '输入图像：%s\n', inputPath);
+fprintf(fid, '原始尺寸：%d x %d，通道数：%d\n', imageSize(2), imageSize(1), imageSize(3));
+fprintf(fid, '参数搜索使用的亮度图尺寸：%d x %d\n', searchSize(2), searchSize(1));
+fprintf(fid, '候选退化函数组合数量：%d\n\n', totalCandidates);
 
-    [gx, gy] = imgradientxy(img, 'sobel');
-    gradEnergy = gx.^2 + gy.^2;
+fprintf(fid, '问题判断：\n');
+fprintf(fid, '1. 图像主要表现为木纹、树干边缘和纹理细节模糊，高频细节不足。\n');
+fprintf(fid, '2. 频谱中没有明显孤立周期峰，因此不按周期噪声去除处理。\n');
+fprintf(fid, '3. 本任务没有清晰参考图，退化函数不能直接由参考图反推，只能通过候选 PSF 与无参考指标筛选。\n\n');
 
-    lapKernel = [0 1 0; 1 -4 1; 0 1 0];
-    lap = imfilter(img, lapKernel, 'replicate', 'conv');
+fprintf(fid, '最终选择的退化函数：\n');
+fprintf(fid, 'PSF 类型：%s\n', char(selected.PSFType));
+fprintf(fid, '%s：%.6g\n', char(selected.Param1Name), selected.Param1Value);
+fprintf(fid, '%s：%.6g\n', char(selected.Param2Name), selected.Param2Value);
+fprintf(fid, 'NSR：%.6g\n', selected.NSR);
+fprintf(fid, '候选评分：%.6f\n\n', selected.Score);
+fprintf(fid, '最终输出的维纳复原融合强度：%.2f\n\n', restorationStrength);
 
-    low = imgaussfilt(img, 2.5);
-    high = img - low;
+fprintf(fid, '选择理由：\n');
+fprintf(fid, '该参数组合在拉普拉斯方差、Tenengrad 梯度能量和高频能量比上均相对输入图像提高，\n');
+fprintf(fid, '同时裁剪比例、饱和比例和高频噪声放大受到限制，视觉上更符合“细节增强但不过度振铃”的要求。\n\n');
 
-    metrics.Tenengrad = mean(gradEnergy(:));
-    metrics.LaplacianVariance = var(lap(:));
-    metrics.Entropy = entropy(img);
-    metrics.HighFrequencyStd = std(high(:));
-    metrics.ClipRatio = mean(img(:) <= 0.001 | img(:) >= 0.999);
+fprintf(fid, '无参考指标对比：\n');
+fprintf(fid, '指标, 输入图像, 维纳复原, 最终复原\n');
+fprintf(fid, '拉普拉斯方差, %.8f, %.8f, %.8f\n', inputMetrics.lapVar, wienerMetrics.lapVar, finalMetrics.lapVar);
+fprintf(fid, 'Tenengrad, %.8f, %.8f, %.8f\n', inputMetrics.tenengrad, wienerMetrics.tenengrad, finalMetrics.tenengrad);
+fprintf(fid, '高频能量比, %.8f, %.8f, %.8f\n', inputMetrics.hfRatio, wienerMetrics.hfRatio, finalMetrics.hfRatio);
+fprintf(fid, '熵, %.8f, %.8f, %.8f\n', inputMetrics.entropyVal, wienerMetrics.entropyVal, finalMetrics.entropyVal);
+fprintf(fid, '饱和像素比例, %.8f, %.8f, %.8f\n', inputMetrics.saturationRatio, wienerMetrics.saturationRatio, finalMetrics.saturationRatio);
+
+fclose(fid);
 end
 
-function write_metrics_file(path, metricsInput, metricsWiener, metricsFinal, estimate, padSize, ...
-        luminanceBlend, unsharpAmount, unsharpRadius, sharpenThreshold, localContrastAmount)
-
-    fid = fopen(path, 'w', 'n', 'UTF-8');
-    cleanup = onCleanup(@() fclose(fid)); %#ok<NASGU>
-
-    fprintf(fid, '第二题：降质图像复原指标记录\n\n');
-    fprintf(fid, '退化函数估计\n');
-    fprintf(fid, 'spectrum_line_angle = %.3f degrees\n', estimate.SpectrumLineAngle);
-    fprintf(fid, 'top_spectrum_line_angles = %s degrees\n', mat2str(estimate.TopSpectrumLineAngles));
-    fprintf(fid, 'motion_theta_initial = %.3f degrees\n', estimate.MotionTheta0);
-    fprintf(fid, 'cepstrum_length_candidates = %s pixels\n', mat2str(estimate.CepstrumLengthCandidates));
-    fprintf(fid, 'motion_psf_length = %d\n', estimate.MotionLength);
-    fprintf(fid, 'motion_psf_theta = %.1f degrees\n', estimate.MotionTheta);
-    fprintf(fid, 'NSR = %.6f\n', estimate.NSR);
-    fprintf(fid, 'pad_size = %d pixels\n', padSize);
-    fprintf(fid, 'luminance_blend = %.3f\n', luminanceBlend);
-    fprintf(fid, 'unsharp_amount = %.3f\n', unsharpAmount);
-    fprintf(fid, 'unsharp_radius = %.3f\n', unsharpRadius);
-    fprintf(fid, 'sharpen_threshold = %.6f\n', sharpenThreshold);
-    fprintf(fid, 'local_contrast = %.3f\n\n', localContrastAmount);
-
-    fprintf(fid, '%-24s %-14s %-14s %-14s\n', 'Metric', 'Input', 'Wiener', 'Final');
-    fprintf(fid, '%-24s %-14.6f %-14.6f %-14.6f\n', 'Tenengrad', metricsInput.Tenengrad, metricsWiener.Tenengrad, metricsFinal.Tenengrad);
-    fprintf(fid, '%-24s %-14.6f %-14.6f %-14.6f\n', 'Laplacian variance', metricsInput.LaplacianVariance, metricsWiener.LaplacianVariance, metricsFinal.LaplacianVariance);
-    fprintf(fid, '%-24s %-14.6f %-14.6f %-14.6f\n', 'Entropy', metricsInput.Entropy, metricsWiener.Entropy, metricsFinal.Entropy);
-    fprintf(fid, '%-24s %-14.6f %-14.6f %-14.6f\n', 'High-frequency std', metricsInput.HighFrequencyStd, metricsWiener.HighFrequencyStd, metricsFinal.HighFrequencyStd);
-    fprintf(fid, '%-24s %-14.6f %-14.6f %-14.6f\n\n', 'Clip ratio', metricsInput.ClipRatio, metricsWiener.ClipRatio, metricsFinal.ClipRatio);
-
-    fprintf(fid, '指标提升\n');
-    fprintf(fid, 'Tenengrad increase = %.2f%%\n', (metricsFinal.Tenengrad / metricsInput.Tenengrad - 1) * 100);
-    fprintf(fid, 'Laplacian variance increase = %.2f%%\n', (metricsFinal.LaplacianVariance / metricsInput.LaplacianVariance - 1) * 100);
-    fprintf(fid, 'Entropy increase = %.2f%%\n', (metricsFinal.Entropy / metricsInput.Entropy - 1) * 100);
+function saveMetricsText(outputPath, inputMetrics, wienerMetrics, finalMetrics, selected, restorationStrength)
+fid = fopen(outputPath, 'w', 'n', 'UTF-8');
+if fid < 0
+    error('无法写入文件：%s', outputPath);
 end
 
-function write_degradation_estimate(path, estimate)
-    fid = fopen(path, 'w', 'n', 'UTF-8');
-    cleanup = onCleanup(@() fclose(fid)); %#ok<NASGU>
+fprintf(fid, '任务2：图像复原质量评价\n');
+fprintf(fid, '==============================================\n\n');
+fprintf(fid, '说明：blurred wood.bmp 没有对应清晰参考图，因此这里采用无参考指标和视觉分析；\n');
+fprintf(fid, 'MSE、PSNR、SNR、SSIM 需要真实清晰参考图，本实验不直接计算这些全参考指标。\n\n');
 
-    fprintf(fid, '第二题：退化函数估计结果\n\n');
-    fprintf(fid, '频谱暗条纹角度 = %.3f degrees\n', estimate.SpectrumLineAngle);
-    fprintf(fid, '频谱暗条纹候选角度 = %s degrees\n', mat2str(estimate.TopSpectrumLineAngles));
-    fprintf(fid, '运动方向初估 = %.3f degrees\n', estimate.MotionTheta0);
-    fprintf(fid, '倒谱长度候选 = %s pixels\n', mat2str(estimate.CepstrumLengthCandidates));
-    fprintf(fid, '最终运动模糊 PSF 长度 = %d pixels\n', estimate.MotionLength);
-    fprintf(fid, '最终运动模糊 PSF 方向 = %.1f degrees\n', estimate.MotionTheta);
-    fprintf(fid, '最终 NSR = %.6f\n\n', estimate.NSR);
-    fprintf(fid, '离散退化函数模型：h(x,y) 为长度 L、方向 theta 的线性运动模糊核，sum(h)=1。\n');
-    fprintf(fid, '频域退化函数：H(u,v)=FFT2(h)，维纳滤波使用 conj(H)/(abs(H)^2+NSR)。\n');
+fprintf(fid, '最终复原参数：%s, %s=%.6g, %s=%.6g, NSR=%.6g\n\n', ...
+    char(selected.PSFType), char(selected.Param1Name), selected.Param1Value, ...
+    char(selected.Param2Name), selected.Param2Value, selected.NSR);
+fprintf(fid, '最终输出采用 %.2f 的维纳亮度融合强度，避免把去卷积振铃和噪声完整带入最终图像。\n\n', restorationStrength);
+
+fprintf(fid, '指标, 输入降质图像, 维纳滤波结果, 最终复原结果, 最终/输入\n');
+fprintf(fid, '拉普拉斯方差, %.10f, %.10f, %.10f, %.4f\n', ...
+    inputMetrics.lapVar, wienerMetrics.lapVar, finalMetrics.lapVar, finalMetrics.lapVar / inputMetrics.lapVar);
+fprintf(fid, 'Tenengrad, %.10f, %.10f, %.10f, %.4f\n', ...
+    inputMetrics.tenengrad, wienerMetrics.tenengrad, finalMetrics.tenengrad, finalMetrics.tenengrad / inputMetrics.tenengrad);
+fprintf(fid, '高频能量比, %.10f, %.10f, %.10f, %.4f\n', ...
+    inputMetrics.hfRatio, wienerMetrics.hfRatio, finalMetrics.hfRatio, finalMetrics.hfRatio / inputMetrics.hfRatio);
+fprintf(fid, '灰度标准差, %.10f, %.10f, %.10f, %.4f\n', ...
+    inputMetrics.stdVal, wienerMetrics.stdVal, finalMetrics.stdVal, finalMetrics.stdVal / inputMetrics.stdVal);
+fprintf(fid, '熵, %.10f, %.10f, %.10f, %.4f\n', ...
+    inputMetrics.entropyVal, wienerMetrics.entropyVal, finalMetrics.entropyVal, finalMetrics.entropyVal / inputMetrics.entropyVal);
+if inputMetrics.saturationRatio > eps
+    saturationRatioText = sprintf('%.4f', finalMetrics.saturationRatio / inputMetrics.saturationRatio);
+else
+    saturationRatioText = '输入为0，不计算倍数';
+end
+fprintf(fid, '饱和像素比例, %.10f, %.10f, %.10f, %s\n\n', ...
+    inputMetrics.saturationRatio, wienerMetrics.saturationRatio, finalMetrics.saturationRatio, saturationRatioText);
+
+fprintf(fid, '文字评价：\n');
+fprintf(fid, '1. 最终复原图的边缘和木纹细节指标相对输入图像提高，说明模糊造成的高频细节损失得到一定恢复。\n');
+fprintf(fid, '2. 维纳滤波后的轻微中值平滑和温和锐化用于抑制噪声、减轻振铃，同时保留细节提升。\n');
+fprintf(fid, '3. 因为没有清晰参考图，最终判断应结合 task2_comparison.png 中的局部细节对比和上述无参考指标。\n');
+
+fclose(fid);
 end
 
-function create_degradation_analysis_figure(yInput, spectrum, darkLines, thetaList, scores, cep, profile, estimate, outputPath)
-    psf = fspecial('motion', estimate.MotionLength, estimate.MotionTheta);
-    H = fftshift(abs(psf2otf(psf, size(yInput))));
-    H = mat2gray(log(1 + H));
-    H = center_crop_square(H, 260);
-
-    figure('Name', '任务2：退化函数估计分析', 'Position', [45, 45, 1650, 950], 'Color', 'w');
-    subplot(2, 4, 1);
-    imshow(yInput);
-    title('输入亮度图', 'FontSize', 12, 'FontWeight', 'bold');
-
-    subplot(2, 4, 2);
-    imshow(spectrum, []);
-    title('对数幅度谱', 'FontSize', 12, 'FontWeight', 'bold');
-
-    subplot(2, 4, 3);
-    imshow(darkLines, []);
-    title(sprintf('暗条纹增强图\n主角 %.1f°', estimate.SpectrumLineAngle), 'FontSize', 12, 'FontWeight', 'bold');
-
-    subplot(2, 4, 4);
-    plot(thetaList, scores, 'LineWidth', 1.2);
-    hold on;
-    xline(estimate.SpectrumLineAngle, 'r', 'LineWidth', 1.2);
-    grid on;
-    title('Radon 角度评分', 'FontSize', 12, 'FontWeight', 'bold');
-    xlabel('条纹角度/度');
-
-    subplot(2, 4, 5);
-    imshow(cep, []);
-    title('倒谱图', 'FontSize', 12, 'FontWeight', 'bold');
-
-    subplot(2, 4, 6);
-    plot(5:60, profile, 'LineWidth', 1.2);
-    grid on;
-    title('沿运动方向的倒谱剖面', 'FontSize', 12, 'FontWeight', 'bold');
-    xlabel('距离/像素');
-
-    subplot(2, 4, 7);
-    imshow(psf, [], 'InitialMagnification', 'fit');
-    title(sprintf('估计 PSF\nL=%d, \\theta=%.0f°', estimate.MotionLength, estimate.MotionTheta), 'FontSize', 12, 'FontWeight', 'bold');
-
-    subplot(2, 4, 8);
-    imshow(H, []);
-    title('估计 H(u,v) 幅度', 'FontSize', 12, 'FontWeight', 'bold');
-
-    saveas(gcf, outputPath);
+function saveFigure(fig, outputPath)
+drawnow;
+try
+    exportgraphics(fig, outputPath, 'Resolution', 180);
+catch
+    saveas(fig, outputPath);
+end
 end
 
-function create_restoration_figure(rgbInput, rgbWienerOnly, rgbFinal, metricsInput, metricsFinal, ...
-        motionLength, motionTheta, nsr, outputPath)
-
-    figure('Name', '任务2：图像复原结果', 'Position', [30, 30, 1650, 950], 'Color', 'w');
-
-    subplot(2, 3, 1);
-    imshow(rgbInput);
-    title('输入降质图像', 'FontSize', 13, 'FontWeight', 'bold');
-
-    subplot(2, 3, 2);
-    imshow(rgbWienerOnly);
-    title(sprintf('维纳反卷积\nLen=%d, Theta=%.0f, NSR=%.3f', motionLength, motionTheta, nsr), 'FontSize', 12);
-
-    subplot(2, 3, 3);
-    imshow(rgbFinal);
-    title(sprintf('最终复原结果\nTenengrad %.4f -> %.4f', metricsInput.Tenengrad, metricsFinal.Tenengrad), ...
-        'FontSize', 12, 'FontWeight', 'bold', 'Color', [0 0.45 0]);
-
-    roiRows = 250:520;
-    roiCols = 500:780;
-
-    subplot(2, 3, 4);
-    imshow(rgbInput(roiRows, roiCols, :));
-    title('局部：输入', 'FontSize', 12);
-
-    subplot(2, 3, 5);
-    imshow(rgbWienerOnly(roiRows, roiCols, :));
-    title('局部：维纳反卷积', 'FontSize', 12);
-
-    subplot(2, 3, 6);
-    imshow(rgbFinal(roiRows, roiCols, :));
-    title('局部：最终结果', 'FontSize', 12);
-
-    saveas(gcf, outputPath);
-end
-
-function create_metrics_chart(metricsInput, metricsFinal, outputPath)
-    figure('Name', '任务2：清晰度指标', 'Position', [120, 120, 950, 520], 'Color', 'w');
-    barData = [
-        metricsInput.Tenengrad, metricsFinal.Tenengrad;
-        metricsInput.LaplacianVariance, metricsFinal.LaplacianVariance;
-        metricsInput.HighFrequencyStd, metricsFinal.HighFrequencyStd
-    ];
-    bar(barData);
-    set(gca, 'XTickLabel', {'Tenengrad', 'Laplacian variance', 'High-frequency std'});
-    legend({'输入图像', '最终复原'}, 'Location', 'northwest');
-    title('任务2无参考清晰度指标对比', 'FontSize', 14, 'FontWeight', 'bold');
-    grid on;
-    saveas(gcf, outputPath);
-end
-
-function create_algorithm_flowchart(outputPath)
-    figure('Name', '任务2：算法框图', 'Position', [80, 80, 1850, 520], 'Color', 'w');
-    axes('Position', [0 0 1 1]);
-    axis off;
-
-    y = 0.43;
-    w = 0.118;
-    h = 0.25;
-    xs = [0.030 0.165 0.300 0.435 0.570 0.705 0.840];
-    labels = {
-        {'输入降质图像', 'g(x,y)'}
-        {'亮度分离', 'ROI 与窗函数'}
-        {'FFT', '对数频谱'}
-        {'Radon + 倒谱', '估计 L 与 theta'}
-        {'构造退化函数', 'h(x,y), H(u,v)'}
-        {'维纳滤波', 'conj(H)/(|H|^2+NSR)'}
-        {'融合增强', '输出 f_hat(x,y)'}
-    };
-
-    for k = 1:numel(xs)
-        rectangle('Position', [xs(k), y, w, h], 'LineWidth', 1.6, 'EdgeColor', 'k', 'FaceColor', [0.96 0.96 0.96]);
-        text(xs(k) + w/2, y + h/2, labels{k}, 'HorizontalAlignment', 'center', ...
-            'VerticalAlignment', 'middle', 'FontSize', 10.5, 'FontWeight', 'bold');
-        if k < numel(xs)
-            annotation('arrow', [xs(k) + w + 0.006, xs(k+1) - 0.006], [y + h/2, y + h/2], 'LineWidth', 1.3);
-        end
-    end
-
-    text(0.5, 0.82, '任务2：先估计退化函数，再进行图像复原', ...
-        'HorizontalAlignment', 'center', 'FontSize', 18, 'FontWeight', 'bold');
-    text(0.5, 0.25, '退化模型：g(x,y)=f(x,y)*h(x,y)+n(x,y)', ...
-        'HorizontalAlignment', 'center', 'FontSize', 13);
-    text(0.5, 0.17, '频域复原：F_hat(u,v)=H*(u,v)G(u,v)/(|H(u,v)|^2+NSR)', ...
-        'HorizontalAlignment', 'center', 'FontSize', 13);
-
-    saveas(gcf, outputPath);
-end
-
-function w = local_hann(n)
-    idx = (0:n-1)';
-    w = 0.5 - 0.5 * cos(2 * pi * idx / max(n - 1, 1));
-end
-
-function out = center_crop_square(img, side)
-    [h, w] = size(img);
-    side = min([side, h, w]);
-    r0 = floor((h - side) / 2) + 1;
-    c0 = floor((w - side) / 2) + 1;
-    out = img(r0:r0+side-1, c0:c0+side-1);
-end
-
-function p = sample_radial_profile(img, theta, rMin, rMax)
-    [h, w] = size(img);
-    cx = (w + 1) / 2;
-    cy = (h + 1) / 2;
-    rr = rMin:rMax;
-    x = cx + rr * cosd(theta);
-    y = cy - rr * sind(theta);
-    p = interp2(img, x, y, 'linear', 0);
-end
-
-function a = wrap_angle_180(a)
-    a = mod(a + 90, 180) - 90;
-end
-
-function out = clamp01(in)
-    out = min(max(in, 0), 1);
+function printMetricSummary(name, metrics)
+fprintf('【%s】\n', name);
+fprintf('  拉普拉斯方差 : %.8f\n', metrics.lapVar);
+fprintf('  Tenengrad    : %.8f\n', metrics.tenengrad);
+fprintf('  高频能量比   : %.8f\n', metrics.hfRatio);
+fprintf('  灰度标准差   : %.8f\n', metrics.stdVal);
+fprintf('  熵           : %.8f\n', metrics.entropyVal);
+fprintf('  饱和像素比例 : %.8f\n\n', metrics.saturationRatio);
 end

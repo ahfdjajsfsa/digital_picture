@@ -1,0 +1,9 @@
+我们需要完成d:\Github\School\digita  
+  l_picture\README.md中的第二图              
+  图像复原。请你首先了解项目结构，确认各个   
+  文件夹都放什么东西。再规划图像复原问题的   
+  解答。思路是首先预估退化函数，按照这个流   
+  程来d:\Github\School\digital_picture\imag  
+  e.png。请把解决问题的全流程事无巨细地写进  
+  d:\Github\School\digital_picture\goal.md   
+  中。不要看git历史.
