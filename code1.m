@@ -1,6 +1,6 @@
 % =========================================================================
 % 课程设计3 - 任务1：图像增强算法设计（最终版本）
-% 策略：频域陷波 + 非局部均值 + 维纳滤波 + 温和锐化
+% 策略：频域陷波 + 中值滤波 + 非局部均值 + 维纳滤波 + 温和锐化
 % 目标：在保持高SSIM的同时，视觉效果明显改善
 % =========================================================================
 
@@ -37,57 +37,64 @@ F_noisy = fft2(noisyImg);
 F_shifted = fftshift(F_noisy);
 spectrum = abs(F_shifted);
 
-% 频率坐标
-u = 0:(M-1);
-v = 0:(N-1);
-idx = find(u > M/2);
-u(idx) = u(idx) - M;
-idy = find(v > N/2);
-v(idy) = v(idy) - N;
-[V, U] = meshgrid(v, u);
+% fftshift 后频谱低频在中心，因此频率坐标也必须以中心点为零点
+center_u = floor(M/2) + 1;
+center_v = floor(N/2) + 1;
+[V, U] = meshgrid((1:N) - center_v, (1:M) - center_u);
 D = sqrt(U.^2 + V.^2);
 
-% 检测周期噪声峰值
-center_u = ceil(M/2);
-center_v = ceil(N/2);
-search_mask = (D > 10) & (D < min(M,N)/2.3);
-spectrum_search = spectrum .* search_mask;
+% 检测周期噪声峰值：用对数频谱和局部极大值，避免整片高能区域被重复陷波
+log_spectrum = log(1 + spectrum);
+search_mask = (D > 12) & (D < min(M,N)/2.05);
+spectrum_search = log_spectrum;
+spectrum_search(~search_mask) = 0;
 valid_vals = spectrum_search(search_mask);
-threshold = median(valid_vals) + 5 * std(valid_vals);
-[peak_rows, peak_cols] = find(spectrum_search > threshold);
+threshold = mean(valid_vals) + 3.8 * std(valid_vals);
+peak_mask = imregionalmax(spectrum_search) & search_mask & (spectrum_search > threshold);
+[peak_rows, peak_cols] = find(peak_mask);
+
+% 只保留最强的少量周期峰，过多陷波会把图像细节一起削弱
+max_peaks = 8;
+if length(peak_rows) > max_peaks
+    peak_vals = spectrum_search(sub2ind(size(spectrum_search), peak_rows, peak_cols));
+    [~, order_idx] = sort(peak_vals, 'descend');
+    order_idx = order_idx(1:max_peaks);
+    peak_rows = peak_rows(order_idx);
+    peak_cols = peak_cols(order_idx);
+end
 
 fprintf('  → 检测到 %d 个周期噪声峰值\n', length(peak_rows));
 
 % 创建陷波滤波器
 notch_filter = ones(M, N);
-D0 = 6;
-n = 6;
+D0 = 4;
+n = 4;
 
 for k = 1:length(peak_rows)
     uk = peak_rows(k) - center_u;
     vk = peak_cols(k) - center_v;
 
-    Dk_pos = sqrt((U - uk).^2 + (V - vk).^2);
-    Dk_neg = sqrt((U + uk).^2 + (V + vk).^2);
+    Dk = sqrt((U - uk).^2 + (V - vk).^2);
+    Hk = 1 ./ (1 + (D0 ./ (Dk + eps)).^(2*n));
 
-    Hk_pos = 1 ./ (1 + (D0 ./ (Dk_pos + 0.01)).^(2*n));
-    Hk_neg = 1 ./ (1 + (D0 ./ (Dk_neg + 0.01)).^(2*n));
-
-    notch_filter = notch_filter .* Hk_pos .* Hk_neg;
+    notch_filter = notch_filter .* Hk;
 end
 
 % 应用滤波
 F_filtered = F_shifted .* notch_filter;
 img_step1 = real(ifft2(ifftshift(F_filtered)));
+img_step1 = max(0, min(255, img_step1));
 
 ssim_step1 = ssim(uint8(img_step1), uint8(originalImg));
 fprintf('  → 完成，SSIM = %.4f\n\n', ssim_step1);
 
 % -------------------------------------------------------------------------
-% 3. 非局部均值滤波 - 强力去噪（平衡去噪与锐度）
+% 3. 中值滤波 + 非局部均值滤波 - 去除白点并平衡去噪与锐度
 % -------------------------------------------------------------------------
-fprintf('【步骤2】非局部均值滤波\n');
-img_step2 = imnlmfilt(img_step1, 'DegreeOfSmoothing', 15);
+fprintf('【步骤2】中值滤波 + 非局部均值滤波\n');
+img_median = medfilt2(uint8(img_step1), [3 3], 'symmetric');
+img_step2 = imnlmfilt(img_median, 'DegreeOfSmoothing', 14);
+img_step2 = double(img_step2);
 ssim_step2 = ssim(uint8(img_step2), uint8(originalImg));
 fprintf('  → 完成，SSIM = %.4f\n\n', ssim_step2);
 
@@ -103,7 +110,7 @@ fprintf('  → 完成，SSIM = %.4f\n\n', ssim_step3);
 % 5. 双边滤波 - 保持边缘
 % -------------------------------------------------------------------------
 fprintf('【步骤4】双边滤波保持边缘\n');
-img_step4 = imbilatfilt(img_step3, 1.2*std(img_step3(:)), 1.3);
+img_step4 = imbilatfilt(img_step3, 1.25*std(img_step3(:)), 1.4);
 ssim_step4 = ssim(uint8(img_step4), uint8(originalImg));
 fprintf('  → 完成，SSIM = %.4f\n\n', ssim_step4);
 
@@ -111,8 +118,8 @@ fprintf('  → 完成，SSIM = %.4f\n\n', ssim_step4);
 % 6. 适度锐化 - 恢复细节
 % -------------------------------------------------------------------------
 fprintf('【步骤5】细节增强\n');
-img_blurred = imgaussfilt(img_step4, 0.6);
-img_final = img_step4 + 0.5 * (img_step4 - img_blurred);  % 适度锐化0.5
+img_blurred = imgaussfilt(img_step4, 0.7);
+img_final = img_step4 + 0.35 * (img_step4 - img_blurred);  % 适度增强锐度，避免重新放大白点
 img_final = max(0, min(255, img_final));
 
 % 7. 质量评估
@@ -167,17 +174,18 @@ if ssim_final >= 0.7
     fprintf('  ✓✓✓ 优秀 - 图像质量显著改善，SSIM ≥ 0.7\n');
 elseif ssim_final >= 0.5
     fprintf('  ✓✓  良好 - 去噪效果明显，视觉改善显著\n');
-    fprintf('       周期噪声完全消除，随机噪声大幅降低\n');
+    fprintf('       周期噪声和背景白点得到明显抑制\n');
 else
     fprintf('  ✓   一般 - 有一定改善\n');
 end
 
 fprintf('\n【算法流程】\n');
 fprintf('  1. 频域陷波滤波 → 去除周期噪声（网格纹理）\n');
-fprintf('  2. 非局部均值滤波 → 强力降低随机噪声\n');
-fprintf('  3. 维纳滤波 → 去除残余噪声\n');
-fprintf('  4. 双边滤波 → 保持边缘清晰度\n');
-fprintf('  5. 温和锐化 → 恢复细节\n');
+fprintf('  2. 3x3中值滤波 → 去除背景白点/脉冲噪声\n');
+fprintf('  3. 非局部均值滤波 → 降低随机噪声\n');
+fprintf('  4. 维纳滤波 → 去除残余噪声\n');
+fprintf('  5. 双边滤波 → 保持边缘清晰度\n');
+fprintf('  6. 温和锐化 → 恢复细节\n');
 
 fprintf('==============================================\n\n');
 
@@ -216,7 +224,7 @@ title(sprintf('步骤1：陷波滤波\nSSIM: %.4f', ssim_step1), 'FontSize', 10)
 
 subplot(3,6,10);
 imshow(uint8(img_step2));
-title(sprintf('步骤2：非局部均值\nSSIM: %.4f', ssim_step2), 'FontSize', 10);
+title(sprintf('步骤2：中值+非局部均值\nSSIM: %.4f', ssim_step2), 'FontSize', 10);
 
 subplot(3,6,11);
 imshow(uint8(img_step4));
@@ -295,8 +303,8 @@ fprintf('  • 【任务1】简洁对比图.png - 三图对比（供报告使用
 
 fprintf('==============================================\n');
 fprintf('  任务1完成！\n');
-fprintf('  ✓ 周期噪声已完全去除\n');
-fprintf('  ✓ 随机噪声显著降低\n');
+fprintf('  ✓ 周期噪声明显抑制\n');
+fprintf('  ✓ 背景白点和随机噪声显著降低\n');
 fprintf('  ✓ 图像质量指标大幅提升\n');
 fprintf('  ✓ 肉眼可见明显改善\n');
 fprintf('==============================================\n');
